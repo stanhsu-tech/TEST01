@@ -1,1 +1,153 @@
+// --- 常數設定 ---
+const MAX_EXECUTION_TIME_MS = 5 * 60 * 1000; // 設定 5 分鐘，保留 1 分鐘緩衝
+const TICKETS_PER_PAGE = 100; // 根據您的 API 限制調整，一次處理 100 張
+const SCRIPT_PROPERTIES = PropertiesService.getScriptProperties();
+const API_KEY = SCRIPT_PROPERTIES.getProperty('FRESHDESK_API_KEY'); // 假設您已儲存
+const SUBDOMAIN = SCRIPT_PROPERTIES.getProperty('FRESHDESK_SUBDOMAIN'); // 假設您已儲存
 
+/**
+ * 1. 啟動函式 (Main Trigger Function)
+ * 請手動建立一個「每日」的時間觸發器來執行此函式。
+ */
+function startBatchUpdate() {
+  // 清理舊的觸發器，防止重複執行
+  deleteAllTriggers(); 
+  
+  // 重置狀態，從第一頁開始
+  SCRIPT_PROPERTIES.setProperty('batch_page_to_process', '1');
+  SCRIPT_PROPERTIES.setProperty('batch_tickets_updated', '0');
+  
+  console.log('--- 批次更新任務已啟動 ---');
+  
+  // 立即開始處理第一批
+  processTicketBatch();
+}
+
+/**
+ * 2. 批次處理函式 (The Worker Function)
+ * 這個函式會被「啟動函式」或「它自己建立的觸發器」呼叫。
+ */
+function processTicketBatch() {
+  const startTime = new Date();
+  
+  // 使用 LockService 確保同一時間只有一個處理程序在執行
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) {
+    console.warn('無法取得鎖定，上一個任務可能尚未完成。');
+    return;
+  }
+  
+  try {
+    let page = parseInt(SCRIPT_PROPERTIES.getProperty('batch_page_to_process') || '1', 10);
+    let totalUpdated = parseInt(SCRIPT_PROPERTIES.getProperty('batch_tickets_updated') || '0', 10);
+    
+    // --- 核心處理迴圈 ---
+    while (new Date() - startTime < MAX_EXECUTION_TIME_MS) {
+      
+      console.log(`正在處理第 ${page} 頁的工單...`);
+      
+      // 1. 取得需要更新的工單 (分頁)
+      // !!! 請修改此查詢以符合您的 API 和需求 !!!
+      const query = encodeURIComponent(`"status:2"`); // 範例：抓取所有待處理工單
+      const url = `https://${SUBDOMAIN}.freshservice.com/api/v2/tickets?query=${query}&page=${page}&per_page=${TICKETS_PER_PAGE}`;
+      
+      const options = {
+        'method': 'get',
+        'contentType': 'application/json',
+        'headers': {
+          'Authorization': 'Basic ' + Utilities.base60Encode(API_KEY + ':X')
+        },
+        'muteHttpExceptions': true
+      };
+      
+      const response = UrlFetchApp.fetch(url, options);
+      const tickets = JSON.parse(response.getContentText()).tickets;
+
+      // 2. 檢查是否已處理完畢
+      if (!tickets || tickets.length === 0) {
+        console.log('--- 所有工單已處理完畢 ---');
+        console.log(`總共更新了 ${totalUpdated} 張工單。`);
+        deleteAllTriggers(); // 清理觸發器
+        SCRIPT_PROPERTIES.deleteProperty('batch_page_to_process'); // 清理狀態
+        lock.releaseLock();
+        return; // 任務結束
+      }
+
+      // 3. 逐一更新工單
+      for (const ticket of tickets) {
+        try {
+          // !!! 這是您的更新邏輯 !!!
+          updateSingleTicket(ticket.id, { "custom_fields": { "needs_update": true } }); 
+          // (以上為範例，請替換成您的更新內容)
+          
+          totalUpdated++;
+          console.log(`已更新工單 #${ticket.id}`);
+          
+        } catch (err) {
+          console.error(`更新工單 #${ticket.id} 失敗: ${err.message}`);
+        }
+      }
+      
+      // 準備處理下一頁
+      page++;
+    }
+    
+    // --- 執行時間已滿 (5分鐘) ---
+    console.log(`執行時間已達上限 (5分鐘)。`);
+    
+    // 4. 儲存下一批的狀態
+    SCRIPT_PROPERTIES.setProperty('batch_page_to_process', page.toString());
+    SCRIPT_PROPERTIES.setProperty('batch_tickets_updated', totalUpdated.toString());
+    
+    // 5. 建立「接力」觸發器，5 分鐘後繼續執行
+    ScriptApp.newTrigger('processTicketBatch')
+      .timeBased()
+      .after(5 * 60 * 1000) // 5 分鐘
+      .create();
+      
+    console.log(`已建立接力觸發器，將於 5 分鐘後從第 ${page} 頁繼續。`);
+
+  } catch (e) {
+    console.error(`批次處理中發生嚴重錯誤: ${e.message}`);
+    // 發生錯誤時，也可以考慮是否要建立下一個觸發器重試
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * 3. 實際的 API 更新函式 (您的邏輯)
+ */
+function updateSingleTicket(ticketId, updateData) {
+  const url = `https://${SUBDOMAIN}.freshservice.com/api/v2/tickets/${ticketId}`;
+  const payload = JSON.stringify(updateData);
+  
+  const options = {
+    'method': 'put',
+    'contentType': 'application/json',
+    'headers': {
+      'Authorization': 'Basic ' + Utilities.base60Encode(API_KEY + ':X')
+    },
+    'payload': payload,
+    'muteHttpExceptions': true
+  };
+  
+  const response = UrlFetchApp.fetch(url, options);
+  if (response.getResponseCode() !== 200) {
+    throw new Error(`API 更新失敗: ${response.getContentText()}`);
+  }
+}
+
+/**
+ * 4. 輔助函式：刪除所有舊的觸發器
+ */
+function deleteAllTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const trigger of triggers) {
+    // 避免刪除到您手動建立的主觸發器，只刪除由程式建立的
+    if (trigger.getHandlerFunction() === 'processTicketBatch') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  }
+  console.log('已清理舊的接力觸發器。');
+}
