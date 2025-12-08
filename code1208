@@ -1,1 +1,203 @@
+/**
+ * doPost 函式處理來自 Freshdesk 的 Webhook 請求。
+ * 升級版功能：
+ * 1. 解析工單內容中的圖片連結。
+ * 2. 下載圖片並轉換為 Base64。
+ * 3. 呼叫 Gemini API，同時傳入文字與圖片，進行多模態分析。
+ * 4. 更新工單群組並新增 AI 解決方案作為私密備註。
+ */
+const doPost = (e) => {
+  try {
+    const scriptProperties = PropertiesService.getScriptProperties();
 
+    // --- 1. 安全認證 ---
+    const SECRET_TOKEN = scriptProperties.getProperty('SECRET_TOKEN');
+    if (e.parameter.token !== SECRET_TOKEN) {
+      throw new Error('無效的 Token。拒絕處理請求。');
+    }
+    console.log('Token 驗證成功。');
+
+    // --- 2. 解析 Payload ---
+    const postData = JSON.parse(e.postData.contents);
+    const ticketData = {
+      id: postData.ticket_id,
+      subject: postData.subject,
+      description: postData.description, // HTML 內容，用於解析圖片
+      description_text: postData.description_text // 純文字內容，用於文字分析
+    };
+    if (!ticketData.id || !ticketData.subject) {
+      throw new Error('傳入的 Payload 格式不完整。');
+    }
+    console.log(`成功解析工單 #${ticketData.id} 的資料。`);
+
+    // --- 3. 處理圖片 ---
+    let imageBlob = null;
+    
+    const imageUrl = parseImageUrlFromHtml(ticketData.description);
+
+    if (imageUrl) {
+      console.log(`在工單描述中發現圖片，URL: ${imageUrl}`);
+      try {
+        imageBlob = UrlFetchApp.fetch(imageUrl).getBlob();
+        console.log(`圖片下載成功，MIME Type: ${imageBlob.getContentType()}`);
+      } catch (imgErr) {
+        console.error(`下載圖片失敗: ${imgErr.message}。將僅使用文字內容進行分析。`);
+        imageBlob = null;
+      }
+    } else {
+      console.log("工單描述中未發現圖片。");
+    }
+
+    // --- 4. 呼叫 Gemini API (多模態) ---
+    const geminiResult = getClassificationAndSolution(ticketData.subject, ticketData.description_text, imageBlob);
+    const category = geminiResult.category;
+    const solution = geminiResult.solution;
+    console.log(`Gemini API 分類結果: ${category}`);
+    console.log(`Gemini API 解決方案:\n${solution}`);
+
+    // --- 5. 更新工單屬性 ---
+    const INFRA_GROUP_ID = scriptProperties.getProperty('INFRA_GROUP_ID');
+    const DEV_GROUP_ID = scriptProperties.getProperty('DEV_GROUP_ID');
+    const groupId = category === 'Infra' ? INFRA_GROUP_ID : DEV_GROUP_ID;
+    if (!groupId) {
+      throw new Error(`無法根據分類 "${category}" 找到對應的 Group ID。`);
+    }
+    
+    updateTicketGroup(ticketData.id, groupId);
+    console.log(`成功更新工單 #${ticketData.id} 的 Group ID 至: ${groupId}`);
+    
+    addFreshdeskNote(ticketData.id, solution);
+    console.log(`成功將解決方案新增至工單 #${ticketData.id}。`);
+
+  } catch (err) {
+    console.error(`====== 執行失敗 ======`);
+    console.error(`錯誤訊息: ${err.message}`);
+    return HtmlService.createHtmlOutput();
+  }
+  
+  console.log("====== 流程執行成功 ======");
+  return HtmlService.createHtmlOutput();
+};
+
+/**
+ * 從 HTML 內容中解析出第一張圖片的 src URL。
+ */
+const parseImageUrlFromHtml = (htmlContent) => {
+  if (!htmlContent) return null;
+  const match = htmlContent.match(/<img src="([^"]+)"/);
+  return match ? match[1].replace(/&amp;/g, '&') : null;
+};
+
+/**
+ * 呼叫 Gemini API，可同時處理文字與圖片 (Vision 功能)。
+ */
+const getClassificationAndSolution = (subject, description, imageBlob) => {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const GEMINI_API_KEY = scriptProperties.getProperty('GEMINI_API_KEY');
+  // 【修正】已將模型還原為您原本使用的 gemini-2.5-flash
+  const API_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+  
+  const prompt = `
+    # 角色與任務
+    你是一位頂尖的 Google Cloud 技術支援專家 AI。你的任務是分析下方的工單文字和附加圖片（如果有的話），完成以下兩件事：
+    1.  **精準分類**：將工單歸類至「Infra」或「Dev」。
+    2.  **提出解決方案**：根據文字和**圖片中的錯誤訊息或畫面情境**，以專業、步驟化的方式提供解決方案建議。
+
+    # 分類標準
+    * **Infra (基礎設施)**：關於 GCE VM、VPC 網路、Cloud Storage、IAM、安全性等核心基礎設施的問題。
+    * **Dev (開發與維運)**：關於 GKE、Cloud Run、CI/CD、Cloud Functions、Vertex AI 等應用開發、部署、容器化與機器學習的問題。
+
+    # 解決方案指南
+    * 語言：使用繁體中文，格式為 Markdown。
+    * 開頭：以「**AI 初步分析與建議：**」作為開頭 (使用粗體)。
+    * 內容：提供 2-3 個具體的檢查步驟或建議。
+
+    # 輸出格式指令
+    你的回覆必須是一個結構完整的 JSON 物件，其中包含兩個鍵：
+    1.  \`category\` (string)：其值必須是 "Infra" 或 "Dev"。
+    2.  \`solution\` (string)：其值為你產生的 Markdown 格式解決方案。
+    請勿在 JSON 物件之外添加任何額外的文字或註解。
+
+    # 待處理工單資訊
+    * **工單主旨**: ${subject}
+    * **工單描述 (純文字)**: ${description}
+    `;
+
+  const requestBodyParts = [{ "text": prompt }];
+  
+  if (imageBlob) {
+    requestBodyParts.push({
+      "inline_data": {
+        "mime_type": imageBlob.getContentType(),
+        "data": Utilities.base64Encode(imageBlob.getBytes())
+      }
+    });
+  }
+
+  const requestBody = {
+    "contents": [{ "parts": requestBodyParts }],
+    "generationConfig": { "responseMimeType": "application/json" }
+  };
+  
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': JSON.stringify(requestBody),
+    'muteHttpExceptions': true
+  };
+
+  // 寫法調整回您的原始風格，將 API Key 放在 fetch 呼叫中
+  const response = UrlFetchApp.fetch(`${API_ENDPOINT}?key=${GEMINI_API_KEY}`, options);
+  const responseCode = response.getResponseCode();
+  const responseBody = response.getContentText();
+
+  if (responseCode === 200) {
+    const parsedResponse = JSON.parse(responseBody);
+    if (!parsedResponse.candidates || parsedResponse.candidates.length === 0) {
+      throw new Error('Gemini API 請求成功，但未回傳任何候選答案。回應: ' + responseBody);
+    }
+    const cleanedText = parsedResponse.candidates[0].content.parts[0].text.replace(/```json\n|\n```/g, '').trim();
+    const result = JSON.parse(cleanedText);
+    if (!result.category || !result.solution) {
+      throw new Error('Gemini 回傳的 JSON 格式不完整。');
+    }
+    return result;
+  } else {
+    throw new Error(`Gemini API 請求失敗，狀態碼 ${responseCode}: ${responseBody}`);
+  }
+};
+
+/**
+ * 將解決方案以私密備註新增到 Freshdesk 工單。
+ */
+const addFreshdeskNote = (ticketId, solution) => {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const FRESHDESK_API_KEY = scriptProperties.getProperty('FRESHDESK_API_KEY');
+  const FRESHDESK_SUBDOMAIN = scriptProperties.getProperty('FRESHDESK_SUBDOMAIN');
+  const API_ENDPOINT = `https://${FRESHDESK_SUBDOMAIN}.freshdesk.com/api/v2/tickets/${ticketId}/notes`;
+
+  const requestBody = { "body": solution, "private": true };
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'headers': {
+      'Authorization': 'Basic ' + Utilities.base64Encode(FRESHDESK_API_KEY + ':X')
+    },
+    'payload': JSON.stringify(requestBody),
+    'muteHttpExceptions': true
+  };
+  const response = UrlFetchApp.fetch(API_ENDPOINT, options);
+  const responseCode = response.getResponseCode();
+  if (responseCode !== 201) { // 201 Created
+    throw new Error(`新增 Freshdesk 備註失敗，狀態碼 ${response.getResponseCode()}: ${response.getContentText()}`);
+  }
+};
+
+/**
+ * 更新工單的負責群組。
+ */
+const updateTicketGroup = (ticketId, groupId) => {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const FRESHDESK_API_KEY = scriptProperties.getProperty('FRESHDESK_API_KEY');
+  const FRESHDESK_SUBDOMAIN = scriptProperties.getProperty('FRESHDESK_SUBDOMAIN');
+  const API_ENDPOINT = `https://
