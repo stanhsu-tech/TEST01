@@ -1,0 +1,43 @@
+name: Sync GitHub Close to Jira Done
+
+# 觸發條件：當 Issue 被 "關閉 (closed)" 時執行
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  close-jira-ticket:
+    runs-on: ubuntu-latest
+    name: Close Jira Issue
+    steps:
+      # 1. 登入 Jira
+      - name: Login to Jira
+        uses: atlassian/gajira-login@master
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+
+      # 2. 尋找 Jira 單號 (這次要找 Issue 的標題和內容)
+      - name: Find Issue Key
+        id: find
+        uses: atlassian/gajira-find-issue-key@master
+        with:
+          # 這裡跟 Push 不一樣，我們要同時掃描 GitHub Issue 的標題與內文
+          string: ${{ github.event.issue.title }} ${{ github.event.issue.body }}
+
+      # 3. 更新 Jira 狀態為 Done
+      - name: Transition Issue to Done
+        uses: atlassian/gajira-transition@master
+        if: steps.find.outputs.issue != ''
+        with:
+          issue: ${{ steps.find.outputs.issue }}
+          transition: "Done" # 請確保您的 Jira 看板上真的有一個狀態叫 "Done"
+          
+      # 4. (選用) 在 Jira 留個言
+      - name: Comment on Issue
+        uses: atlassian/gajira-comment@master
+        if: steps.find.outputs.issue != ''
+        with:
+          issue: ${{ steps.find.outputs.issue }}
+          comment: "✅ GitHub Issue #${{ github.event.issue.number }} 已關閉，同步將此卡片標記為完成。"
