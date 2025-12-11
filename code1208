@@ -5,6 +5,8 @@ const SCRIPT_PROPERTIES = PropertiesService.getScriptProperties();
 const API_KEY = SCRIPT_PROPERTIES.getProperty('FRESHDESK_API_KEY'); // 假設您已儲存
 const SUBDOMAIN = SCRIPT_PROPERTIES.getProperty('FRESHDESK_SUBDOMAIN'); // 假設您已儲存
 
+
+
 /**
  * 1. 啟動函式 (Main Trigger Function)
  * 請手動建立一個「每日」的時間觸發器來執行此函式。
