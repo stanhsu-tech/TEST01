@@ -1,0 +1,45 @@
+name: Update Jira Issue on Push
+
+# 觸發條件：當有人 Push 到 main 分支時執行
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  update-jira:
+    runs-on: ubuntu-latest
+    name: Auto Transition Jira Issue
+    steps:
+      # 1. 登入 Jira (使用您圖片中下半部的 atlassian/gajira-login)
+      - name: Login to Jira
+        uses: atlassian/gajira-login@master
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ secrets.JIRA_USER_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+
+      # 2. 尋找 Jira 單號 (從 Commit 訊息中自動抓取，例如 "MCTT-123 fixed bug")
+      - name: Find Issue Key
+        id: find
+        uses: atlassian/gajira-find-issue-key@master
+        with:
+          string: ${{ github.event.head_commit.message }}
+
+      # 3. 更新 Jira 狀態 (對應您圖片中的 atlassian/gajira-transition)
+      # 例如：當程式碼合併後，把卡片移動到 "Done"
+      - name: Transition Issue to Done
+        uses: atlassian/gajira-transition@master
+        if: steps.find.outputs.issue != ''  # 只有找到單號時才執行
+        with:
+          issue: ${{ steps.find.outputs.issue }}
+          transition: "Done"  # 這裡填寫您 Jira 看板上的狀態名稱 (例如 "In Progress" 或 "Done")
+
+      # 4. (選用) 更新其他欄位 (對應您圖片中上半部的更新功能)
+      # 可以在這裡留言告訴 PM 說已經部署了
+      - name: Comment on Issue
+        uses: atlassian/gajira-comment@master
+        if: steps.find.outputs.issue != ''
+        with:
+          issue: ${{ steps.find.outputs.issue }}
+          comment: "🚀 程式碼已自動部署到 Main 分支！"
