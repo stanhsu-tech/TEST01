@@ -8,7 +8,7 @@ const SUBDOMAIN = SCRIPT_PROPERTIES.getProperty('FRESHDESK_SUBDOMAIN'); // 假�
 
 
 /**
- * 1. 啟動函式 (Main Trigger Function)   ...
+ * 1. 啟動函式 (Main Trigger Function)   . ..
  * 請手動建立一個「每日」的時間觸發器來執行此函式。
  */
 function startBatchUpdate() {
